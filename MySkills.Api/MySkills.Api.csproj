@@ -21,8 +21,9 @@
 
     <ItemGroup>
       <Folder Include="Endpoints\" />
+      <Folder Include="Features\Achievements\" />
+      <Folder Include="Features\Users\" />
       <Folder Include="Migrations\" />
-      <Folder Include="Services\" />
     </ItemGroup>
 
 </Project>

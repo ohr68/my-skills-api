@@ -5,10 +5,18 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using MySkills.Api.Data;
+using MySkills.Api.Features.Activities;
+using MySkills.Api.Features.Dashboard;
+using MySkills.Api.Features.Sessions;
+using MySkills.Api.Interfaces;
 using MySkills.Api.Models;
+using MySkills.Api.Services;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddScoped<IAchievementService, AchievementService>();
+builder.Services.AddScoped<IStreakService, StreakService>();
 
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite("Data Source=devlevel.db"));
@@ -118,77 +126,6 @@ app.MapPost("/login", async (AppDbContext db, LoginRequest request) =>
 
     var jwt = new JwtSecurityTokenHandler().WriteToken(token);
 
-    var achievements = new List<Achievement>();
-
-    bool HasAchievement(string code) =>
-        user.Achievements!.Any(a => a.Code == code);
-
-// First Session
-    if (!user.Sessions!.Any() && !HasAchievement("FIRST_SESSION"))
-    {
-        achievements.Add(new Achievement
-        {
-            Id = Guid.NewGuid(),
-            Code = "FIRST_SESSION",
-            Title = "First Step 🚀",
-            UnlockedAt = DateTime.UtcNow,
-            UserId = user.Id,
-        });
-    }
-
-// Streak 3
-    if (user.CurrentStreak >= 3 && !HasAchievement("STREAK_3"))
-    {
-        achievements.Add(new Achievement
-        {
-            Id = Guid.NewGuid(),
-            Code = "STREAK_3",
-            Title = "On Fire 🔥",
-            UnlockedAt = DateTime.UtcNow,
-            UserId = user.Id,
-        });
-    }
-
-// Streak 7
-    if (user.CurrentStreak >= 7 && !HasAchievement("STREAK_7"))
-    {
-        achievements.Add(new Achievement
-        {
-            Id = Guid.NewGuid(),
-            Code = "STREAK_7",
-            Title = "Consistency Master 💪",
-            UnlockedAt = DateTime.UtcNow,
-            UserId = user.Id,
-        });
-    }
-
-// XP Milestones
-    if (user.TotalXp >= 100 && !HasAchievement("XP_100"))
-    {
-        achievements.Add(new Achievement
-        {
-            Id = Guid.NewGuid(),
-            Code = "XP_100",
-            Title = "100 XP Achieved 🎯",
-            UnlockedAt = DateTime.UtcNow,
-            UserId = user.Id,
-        });
-    }
-
-    if (user.TotalXp >= 500 && !HasAchievement("XP_500"))
-    {
-        achievements.Add(new Achievement
-        {
-            Id = Guid.NewGuid(),
-            Code = "XP_500",
-            Title = "500 XP Elite 🏆",
-            UnlockedAt = DateTime.UtcNow,
-            UserId = user.Id,
-        });
-    }
-
-    db.Achievements.AddRange(achievements);
-
     return Results.Ok(new { token = jwt });
 });
 
@@ -209,182 +146,9 @@ app.MapGet("/me", (ClaimsPrincipal user) =>
     });
 }).RequireAuthorization();
 
-app.MapPost("/activities", async (
-    AppDbContext db,
-    ClaimsPrincipal user,
-    CreateActivityRequest request) =>
-{
-    var userIdClaim = user.FindFirstValue(ClaimTypes.NameIdentifier);
-
-    if (userIdClaim is null)
-        return Results.Unauthorized();
-
-    var userId = Guid.Parse(userIdClaim);
-
-    var existingUser = await db.Users.FindAsync(userId);
-    if (existingUser is null)
-        return Results.NotFound("User not found");
-
-    var xp = GetXpForActivity(request.Type);
-
-    if (xp == 0)
-        return Results.BadRequest("Invalid activity type");
-
-    var activity = new Activity
-    {
-        UserId = userId,
-        Type = request.Type,
-        XpEarned = xp,
-        CompletedAt = DateTime.UtcNow
-    };
-
-    existingUser.TotalXp += xp;
-
-    db.Activities.Add(activity);
-    await db.SaveChangesAsync();
-
-    var level = CalculateLevel(existingUser.TotalXp);
-
-    return Results.Ok(new
-    {
-        totalXp = existingUser.TotalXp,
-        currentLevel = level,
-        xpEarned = xp
-    });
-}).RequireAuthorization();
-
-app.MapGet("/dashboard", async (
-    AppDbContext db,
-    ClaimsPrincipal user) =>
-{
-    var userIdClaim = user.FindFirstValue(ClaimTypes.NameIdentifier);
-
-    if (userIdClaim is null)
-        return Results.Unauthorized();
-
-    var userId = Guid.Parse(userIdClaim);
-
-    var existingUser = await db.Users
-        .Include(u => u.Achievements)
-        .AsNoTracking()
-        .FirstOrDefaultAsync(u => u.Id == userId);
-
-    if (existingUser is null)
-        return Results.NotFound("User not found");
-
-    var recentActivities = await db.Activities
-        .Where(a => a.UserId == userId)
-        .OrderByDescending(a => a.CompletedAt)
-        .Take(5)
-        .Select(a => new
-        {
-            a.Id,
-            a.Type,
-            a.XpEarned,
-            a.CompletedAt
-        })
-        .ToListAsync();
-
-    var level = CalculateLevel(existingUser.TotalXp);
-    var xpToNextLevel = CalculateXpToNextLevel(existingUser.TotalXp);
-
-    var achievements = existingUser.Achievements!
-        .OrderByDescending(a => a.UnlockedAt)
-        .Select(a => new AchievementDto(a.Code, a.Title, a.UnlockedAt))
-        .ToList();
-    
-    return Results.Ok(new
-    {
-        totalXp = existingUser.TotalXp,
-        currentLevel = level,
-        currentStreak = existingUser.CurrentStreak,
-        longestStreak = existingUser.LongestStreak,
-        xpToNextLevel,
-        recentActivities,
-        achievements,
-    });
-}).RequireAuthorization();
-
-app.MapPost("/users/{userId:guid}/sessions", async (
-    Guid userId,
-    CreateSessionDto dto,
-    AppDbContext db) =>
-{
-    var user = await db.Users.FindAsync(userId);
-    if (user is null)
-        return Results.NotFound();
-
-    var session = new Session
-    {
-        Id = Guid.NewGuid(),
-        Title = dto.Title,
-        Type = dto.Type,
-        Difficulty = dto.Difficulty,
-        XpEarned = dto.XpEarned,
-        Date = DateOnly.FromDateTime(DateTime.UtcNow),
-        UserId = userId
-    };
-
-    user.TotalXp += dto.XpEarned;
-
-    var today = DateOnly.FromDateTime(DateTime.UtcNow);
-
-    if (user.LastActivityDate is null)
-    {
-        user.CurrentStreak = 1;
-    }
-    else
-    {
-        var difference = today.DayNumber - user.LastActivityDate.Value.DayNumber;
-
-        if (difference == 0)
-        {
-            // already logged today — do nothing
-        }
-        else if (difference == 1)
-        {
-            user.CurrentStreak += 1;
-        }
-        else
-        {
-            user.CurrentStreak = 1;
-        }
-    }
-
-    if (user.CurrentStreak > user.LongestStreak)
-        user.LongestStreak = user.CurrentStreak;
-
-    user.LastActivityDate = today;
-
-    db.Sessions.Add(session);
-    await db.SaveChangesAsync();
-
-    return Results.Ok(session);
-});
-
-
-static int GetXpForActivity(string type)
-{
-    return type switch
-    {
-        "LeetCodeEasy" => 10,
-        "LeetCodeMedium" => 25,
-        "LeetCodeHard" => 50,
-        "SystemDesign" => 60,
-        "ProjectRefactor" => 80,
-        _ => 0
-    };
-}
-
-static int CalculateLevel(int totalXp)
-{
-    return totalXp / 100;
-}
-
-static int CalculateXpToNextLevel(int totalXp)
-{
-    return 100 - (totalXp % 100);
-}
+app.MapCreateActivity();
+app.MapCreateSession();
+app.MapGetDashboard();
 
 app.UseCors("CorsPolicy");
 
