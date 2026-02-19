@@ -28,21 +28,21 @@ builder.Services.AddCors(options =>
 const string jwtKey = "THIS_IS_SUPER_SECRET_KEY_CHANGE_LATER_123456";
 
 builder.Services.AddAuthentication(options =>
-{
-    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-})
-.AddJwtBearer(options =>
-{
-    options.TokenValidationParameters = new TokenValidationParameters
     {
-        ValidateIssuer = false,
-        ValidateAudience = false,
-        ValidateIssuerSigningKey = true,
-        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-        ValidateLifetime = true
-    };
-});
+        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+    })
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = false,
+            ValidateAudience = false,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
+            ValidateLifetime = true
+        };
+    });
 
 builder.Services.AddAuthorization();
 
@@ -54,10 +54,7 @@ app.UseAuthorization();
 if (app.Environment.IsDevelopment())
 {
     app.MapOpenApi();
-    app.MapScalarApiReference(options =>
-    {
-        options.Title = "Dev Level Tracker API";
-    });
+    app.MapScalarApiReference(options => { options.Title = "Dev Level Tracker API"; });
 }
 
 app.MapGet("/", () => "Dev Level Tracker API Running");
@@ -92,7 +89,10 @@ app.MapPost("/register", async (AppDbContext db, RegisterRequest request) =>
 
 app.MapPost("/login", async (AppDbContext db, LoginRequest request) =>
 {
-    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+    var user = await db.Users
+        .Include(u => u.Achievements)
+        .Include(u => u.Sessions)
+        .FirstOrDefaultAsync(u => u.Email == request.Email);
 
     if (user is null)
         return Results.BadRequest("Invalid credentials");
@@ -117,6 +117,77 @@ app.MapPost("/login", async (AppDbContext db, LoginRequest request) =>
         signingCredentials: credentials);
 
     var jwt = new JwtSecurityTokenHandler().WriteToken(token);
+
+    var achievements = new List<Achievement>();
+
+    bool HasAchievement(string code) =>
+        user.Achievements!.Any(a => a.Code == code);
+
+// First Session
+    if (!user.Sessions!.Any() && !HasAchievement("FIRST_SESSION"))
+    {
+        achievements.Add(new Achievement
+        {
+            Id = Guid.NewGuid(),
+            Code = "FIRST_SESSION",
+            Title = "First Step 🚀",
+            UnlockedAt = DateTime.UtcNow,
+            UserId = user.Id,
+        });
+    }
+
+// Streak 3
+    if (user.CurrentStreak >= 3 && !HasAchievement("STREAK_3"))
+    {
+        achievements.Add(new Achievement
+        {
+            Id = Guid.NewGuid(),
+            Code = "STREAK_3",
+            Title = "On Fire 🔥",
+            UnlockedAt = DateTime.UtcNow,
+            UserId = user.Id,
+        });
+    }
+
+// Streak 7
+    if (user.CurrentStreak >= 7 && !HasAchievement("STREAK_7"))
+    {
+        achievements.Add(new Achievement
+        {
+            Id = Guid.NewGuid(),
+            Code = "STREAK_7",
+            Title = "Consistency Master 💪",
+            UnlockedAt = DateTime.UtcNow,
+            UserId = user.Id,
+        });
+    }
+
+// XP Milestones
+    if (user.TotalXp >= 100 && !HasAchievement("XP_100"))
+    {
+        achievements.Add(new Achievement
+        {
+            Id = Guid.NewGuid(),
+            Code = "XP_100",
+            Title = "100 XP Achieved 🎯",
+            UnlockedAt = DateTime.UtcNow,
+            UserId = user.Id,
+        });
+    }
+
+    if (user.TotalXp >= 500 && !HasAchievement("XP_500"))
+    {
+        achievements.Add(new Achievement
+        {
+            Id = Guid.NewGuid(),
+            Code = "XP_500",
+            Title = "500 XP Elite 🏆",
+            UnlockedAt = DateTime.UtcNow,
+            UserId = user.Id,
+        });
+    }
+
+    db.Achievements.AddRange(achievements);
 
     return Results.Ok(new { token = jwt });
 });
@@ -180,7 +251,6 @@ app.MapPost("/activities", async (
         currentLevel = level,
         xpEarned = xp
     });
-
 }).RequireAuthorization();
 
 app.MapGet("/dashboard", async (
@@ -195,6 +265,7 @@ app.MapGet("/dashboard", async (
     var userId = Guid.Parse(userIdClaim);
 
     var existingUser = await db.Users
+        .Include(u => u.Achievements)
         .AsNoTracking()
         .FirstOrDefaultAsync(u => u.Id == userId);
 
@@ -217,15 +288,79 @@ app.MapGet("/dashboard", async (
     var level = CalculateLevel(existingUser.TotalXp);
     var xpToNextLevel = CalculateXpToNextLevel(existingUser.TotalXp);
 
+    var achievements = existingUser.Achievements!
+        .OrderByDescending(a => a.UnlockedAt)
+        .Select(a => new AchievementDto(a.Code, a.Title, a.UnlockedAt))
+        .ToList();
+    
     return Results.Ok(new
     {
         totalXp = existingUser.TotalXp,
         currentLevel = level,
+        currentStreak = existingUser.CurrentStreak,
+        longestStreak = existingUser.LongestStreak,
         xpToNextLevel,
-        recentActivities
+        recentActivities,
+        achievements,
     });
-
 }).RequireAuthorization();
+
+app.MapPost("/users/{userId:guid}/sessions", async (
+    Guid userId,
+    CreateSessionDto dto,
+    AppDbContext db) =>
+{
+    var user = await db.Users.FindAsync(userId);
+    if (user is null)
+        return Results.NotFound();
+
+    var session = new Session
+    {
+        Id = Guid.NewGuid(),
+        Title = dto.Title,
+        Type = dto.Type,
+        Difficulty = dto.Difficulty,
+        XpEarned = dto.XpEarned,
+        Date = DateOnly.FromDateTime(DateTime.UtcNow),
+        UserId = userId
+    };
+
+    user.TotalXp += dto.XpEarned;
+
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+
+    if (user.LastActivityDate is null)
+    {
+        user.CurrentStreak = 1;
+    }
+    else
+    {
+        var difference = today.DayNumber - user.LastActivityDate.Value.DayNumber;
+
+        if (difference == 0)
+        {
+            // already logged today — do nothing
+        }
+        else if (difference == 1)
+        {
+            user.CurrentStreak += 1;
+        }
+        else
+        {
+            user.CurrentStreak = 1;
+        }
+    }
+
+    if (user.CurrentStreak > user.LongestStreak)
+        user.LongestStreak = user.CurrentStreak;
+
+    user.LastActivityDate = today;
+
+    db.Sessions.Add(session);
+    await db.SaveChangesAsync();
+
+    return Results.Ok(session);
+});
 
 
 static int GetXpForActivity(string type)
@@ -261,5 +396,20 @@ app.Run();
 // =========================
 
 record RegisterRequest(string Name, string Email, string Password);
+
 record LoginRequest(string Email, string Password);
+
 record CreateActivityRequest(string Type);
+
+record CreateSessionDto(
+    string Title,
+    string Type,
+    string Difficulty,
+    int XpEarned
+);
+
+record AchievementDto(
+    string Code,
+    string Title,
+    DateTime UnlockedAt
+);
